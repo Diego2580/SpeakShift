@@ -104,3 +104,14 @@ def send_message(db: Session, payload: ChatSendRequest) -> Message:
     history = _get_recent_history(db, payload.user_id, payload.contact_id)
     bot_text = _generate_bot_reply(contact.system_prompt, history)
     return _save_message(db, payload.user_id, payload.contact_id, SenderType.BOT, bot_text)
+
+def get_chat_history(db: Session, user_id: uuid.UUID, contact_id: uuid.UUID, limit: int = 50) -> list[Message]:
+    """Devuelve el historial de mensajes ordenados cronológicamente."""
+    stmt = (
+        select(Message)
+        .where(Message.user_id == user_id, Message.contact_id == contact_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    )
+    rows = db.execute(stmt).scalars().all()
+    return list(reversed(rows))
