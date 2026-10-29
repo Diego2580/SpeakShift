@@ -11,7 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.entities import Contact, Message, SenderType, UserContact
+from app.models.entities import Contact, Message, SenderType, User, UserContact
 from app.schemas.chat import ChatSendRequest
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,16 @@ HISTORY_LIMIT = 6
 BASE_POINTS = 10          # Puntos por cada mensaje enviado
 NEW_VOCAB_BONUS = 15      # Puntos extra si el usuario usó vocabulario nuevo
 UNLOCK_THRESHOLD = 100    # Afinidad necesaria para desbloquear otro contacto
+
+# Mapa de progresión CEFR: nivel actual -> nivel objetivo
+LEVEL_PROGRESSION = {
+    "A1": "A2",
+    "A2": "B1",
+    "B1": "B2",
+    "B2": "C1",
+    "C1": "Native",
+}
+DEFAULT_ENGLISH_LEVEL = "A1"
 
 # Mapeo de nuestro sender_type al "role" que espera la API de chat completions
 _ROLE_BY_SENDER = {
@@ -47,6 +57,34 @@ JSON_INSTRUCTION = (
 
 # Elimina ```json ... ``` (o ``` ... ```) que algunos modelos añaden alrededor del JSON
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+# -----------------------------------------------------------------------------
+# Lógica CEFR: construcción del system prompt
+# -----------------------------------------------------------------------------
+def _build_system_prompt(contact_prompt: str, english_level: str | None) -> str:
+    """
+    Concatena al system_prompt del contacto la instrucción de tutor progresivo
+    según el nivel CEFR del usuario (nivel actual -> nivel objetivo).
+    """
+    current_level = english_level if english_level else DEFAULT_ENGLISH_LEVEL
+    target_level = LEVEL_PROGRESSION.get(current_level)
+
+    if target_level is None:
+        # Nivel "Native" (o desconocido): no hay un nivel superior al que transicionar
+        instruction = (
+            f"The user's English level is {current_level}. "
+            f"Converse naturally using {current_level}-level vocabulary and idiomatic expressions."
+        )
+    else:
+        instruction = (
+            f"The user's English level is {current_level}. "
+            f"Act as a progressive tutor: converse naturally using {current_level} vocabulary, "
+            f"but gently introduce topics and vocabulary from the {target_level} level "
+            "to help them transition."
+        )
+
+    return f"{contact_prompt}\n\n{instruction}"
 
 
 # -----------------------------------------------------------------------------
@@ -74,8 +112,7 @@ def get_llm_client() -> OpenAI:
 def _candidate_models() -> list[str]:
     """
     Lista ordenada de modelos a intentar: primero LLM_MODEL y luego los de respaldo.
-    Los respaldos son opcionales: define LLM_FALLBACK_MODELS (CSV o lista) en Settings
-    y en el .env, p. ej. LLM_FALLBACK_MODELS=modelo-a,modelo-b
+    Los respaldos son opcionales: LLM_FALLBACK_MODELS=modelo-a,modelo-b (CSV o lista).
     """
     models = [settings.LLM_MODEL]
     extra = getattr(settings, "LLM_FALLBACK_MODELS", None)
@@ -305,16 +342,23 @@ def _apply_progression(
 # -----------------------------------------------------------------------------
 # Caso de uso principal
 # -----------------------------------------------------------------------------
-def send_message(db: Session, payload: ChatSendRequest) -> Message:
+def send_message(db: Session, user_id: uuid.UUID, payload: ChatSendRequest) -> Message:
     """
-    Flujo completo de POST /chat/send (Core Loop):
+    Flujo completo de POST /chat/send (Core Loop). `user_id` proviene del token JWT.
       1. Valida que exista la conversación (user_contacts) y esté desbloqueada.
-      2. Recupera system_prompt + historial previo y llama al LLM (respuesta JSON).
+      2. Arma el system_prompt (contacto + instrucción CEFR según english_level del usuario),
+         recupera el historial previo y llama al LLM (respuesta JSON).
       3. Guarda el mensaje del usuario con `used_new_vocabulary` evaluado por el LLM.
       4. Suma puntos (+10 base, +15 si hubo vocabulario nuevo) y aplica desbloqueos.
       5. Guarda la respuesta del bot (mismo commit que los puntos) y la devuelve.
     """
-    user_id, contact_id = payload.user_id, payload.contact_id
+    contact_id = payload.contact_id
+
+    # Nivel CEFR del usuario, leído desde la BD
+    user = db.get(User, user_id)
+    if user is None:  # Defensivo: get_current_user ya valida que exista
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado.")
+    english_level = user.english_level
 
     # 1. La FK compuesta de `messages` exige que la relación usuario-contacto exista.
     relation = db.execute(
@@ -339,8 +383,9 @@ def send_message(db: Session, payload: ChatSendRequest) -> Message:
     if contact is None:  # Defensivo: la FK debería impedirlo
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contacto no encontrado.")
 
-    # Se copia a una variable local: tras cada commit los objetos ORM expiran.
-    system_prompt = contact.system_prompt
+    # System prompt del contacto + instrucción dinámica CEFR.
+    # Se calcula en una variable local: tras cada commit los objetos ORM expiran.
+    system_prompt = _build_system_prompt(contact.system_prompt, english_level)
 
     # 2. Contexto: (HISTORY_LIMIT - 1) mensajes previos + el mensaje actual = HISTORY_LIMIT
     history = _get_recent_history(db, user_id, contact_id, HISTORY_LIMIT - 1)

@@ -31,6 +31,20 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
 
+    # --- Autenticación y onboarding (Issue #5) ---
+    # Nullable en BD para no romper usuarios previos creados antes de la autenticación.
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Nivel CEFR declarado: A1, A2, B1, B2, C1 o Native
+    english_level: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="A1", server_default="A1"
+    )
+
+    # --- Progreso (columnas ya existentes en init.sql) ---
+    hidden_level_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    streak_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
 
 class Contact(Base):
     __tablename__ = "contacts"
